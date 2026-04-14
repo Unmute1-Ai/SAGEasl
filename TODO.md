@@ -37,7 +37,7 @@
 - [ ] First movement+click level — 11+ games currently at 0
 - [ ] Membot cartridge integration end-to-end (read on start, write on level completion)
 - [ ] Serialization format for GridObservation (msgpack vs JSON vs shared mem) — Andy handoff
-- [ ] GridCartridgeIRP — memory search wrapper (transport-agnostic: MCP or direct)
+- [x] GridCartridgeIRP — memory search wrapper (transport-agnostic: MCP or direct) — DONE 2026-04-01 (`sage/irp/plugins/grid_cartridge_irp.py`)
 
 ### Fast Loop (May)
 - [ ] Strip consciousness loop to game speed (~100ms/cycle)
@@ -100,8 +100,8 @@
 
 ## Fleet & Infrastructure
 
-- [ ] Create shared-context repo for Andy collaboration
-- [ ] Grant Andy collaborator access to SAGE
+- [x] Create shared-context repo for Andy collaboration — DONE (`dp-web4/sage-arc-collab`, 2026-04-01)
+- [x] Grant Andy collaborator access to SAGE — DONE (agro23 invited to SAGE + sage-arc-collab)
 - [ ] Update fleet track registry for ARC-AGI-3 pivot
 - [ ] Nomad schema v1→v2 migration
 - [x] Fleet track registry (SQLite) — DONE

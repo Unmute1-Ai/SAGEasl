@@ -127,8 +127,8 @@ class MetabolicController:
             ),
             MetabolicState.FOCUS: StateConfig(
                 name="focus",
-                atp_consumption_rate=2.0,
-                atp_recovery_rate=0.0,
+                atp_consumption_rate=0.8,  # Was 2.0 (cosmetic) — now wired into update(); 0.8 balances plugin drain
+                atp_recovery_rate=0.3,  # Was 0.0 — partial recovery enables sustained focus
                 max_active_plugins=1,  # Focus on one thing
                 sensor_poll_rate=60.0,  # Higher rate for focused task
                 learning_enabled=True,
@@ -161,7 +161,7 @@ class MetabolicController:
             MetabolicState.CRISIS: StateConfig(
                 name="crisis",
                 atp_consumption_rate=0.05,
-                atp_recovery_rate=0.2,
+                atp_recovery_rate=0.8,  # Was 0.2 — must exceed plugin base cost for recovery
                 max_active_plugins=1,   # Only critical systems
                 sensor_poll_rate=5.0,   # Monitor for danger
                 learning_enabled=False,
@@ -202,9 +202,12 @@ class MetabolicController:
         max_salience = cycle_data.get('max_salience', 0.0)
         crisis_detected = cycle_data.get('crisis_detected', False)
 
-        # Update ATP
+        # Update ATP — apply both state consumption and recovery
+        # Previously consumption_rate was unused (only for priority ranking).
+        # Thor Session 2026-04-11: wired into update() so designed economics take effect.
         config = self.get_current_config()
         self.atp_current -= atp_consumed
+        self.atp_current -= config.atp_consumption_rate  # State-specific metabolic cost
         self.atp_current += config.atp_recovery_rate
         self.atp_current = max(0.0, min(self.atp_max, self.atp_current))
 
@@ -222,11 +225,18 @@ class MetabolicController:
         return self.current_state
 
     def _get_time_in_state(self) -> float:
-        """Get time spent in current state (wall time or cycles)"""
-        if self.simulation_mode:
-            return float(self.total_cycles - self.state_entry_cycle)
-        else:
-            return time.time() - self.state_entry_time
+        """Get time spent in current state in cycle counts.
+
+        Always returns cycle counts (not wall time) so that transition
+        thresholds behave identically in simulation and real modes.
+
+        Thor Session 2026-04-11 12:00: Unified to cycles. Previously,
+        real mode used wall-clock seconds with 10x higher thresholds,
+        creating a 9-22x shortfall that prevented DREAM entry (26 entries
+        in 20.4M cycles). Simulation mode had 47.87% DREAM — proving
+        the thresholds work when time units match.
+        """
+        return float(self.total_cycles - self.state_entry_cycle)
 
     def _determine_next_state(
         self,
@@ -265,8 +275,11 @@ class MetabolicController:
         if self.current_state == MetabolicState.WAKE:
             # WAKE → FOCUS: High salience with sufficient ATP
             # Focus threshold lowered during day (easier to focus)
+            # Lowered from 0.8 to 0.45 based on Session #57 empirical data
+            # (max observed salience ~0.46 during synthetic active learning)
+            # Thor Session #58: Task-responsive metabolic transitions
             focus_threshold = 50.0 / focus_bias
-            if max_salience > 0.8 and self.atp_current > focus_threshold:
+            if max_salience > 0.45 and self.atp_current > focus_threshold:
                 return MetabolicState.FOCUS
 
             # WAKE → REST: Low ATP
@@ -277,8 +290,8 @@ class MetabolicController:
 
             # WAKE → DREAM: Moderate ATP, been awake long enough
             # Dream heavily biased toward night
-            # In simulation mode, use cycle counts (e.g., 30 cycles)
-            dream_time_threshold = max(5, 30 / dream_bias) if self.simulation_mode else max(5, 300 / dream_bias)
+            # Threshold in cycles (unified sim/real — Thor 2026-04-11 12:00 Dream Gap fix)
+            dream_time_threshold = max(5, 30 / dream_bias)
             if 40.0 < self.atp_current < 80.0 and time_in_state > dream_time_threshold:
                 return MetabolicState.DREAM
 
@@ -286,7 +299,10 @@ class MetabolicController:
 
         elif self.current_state == MetabolicState.FOCUS:
             # FOCUS → WAKE: Salience dropped or ATP low
-            if max_salience < 0.5 or self.atp_current < 20.0:
+            # Exit threshold lowered to 0.35 (was 0.5) — fixes Asymmetric Threshold Trap
+            # Audio mock salience 0.46 enters at >0.45 but exited at <0.50; now sustains
+            # Thor Session 2026-04-11: Experiments A/D validated this fix
+            if max_salience < 0.35 or self.atp_current < 20.0:
                 return MetabolicState.WAKE
 
             # FOCUS → REST: ATP critical
@@ -304,9 +320,9 @@ class MetabolicController:
 
             # REST → DREAM: ATP partially recovered, time to consolidate
             # Dream strongly preferred at night
-            # In simulation mode, use cycle counts (e.g., 6 cycles)
+            # Threshold in cycles (unified sim/real — Thor 2026-04-11 12:00 Dream Gap fix)
             dream_atp_threshold = 40.0 / dream_bias
-            dream_time_threshold = max(5, 6 / dream_bias) if self.simulation_mode else max(5, 60 / dream_bias)
+            dream_time_threshold = max(5, 6 / dream_bias)
             if self.atp_current > dream_atp_threshold and time_in_state > dream_time_threshold:
                 return MetabolicState.DREAM
 
@@ -315,9 +331,9 @@ class MetabolicController:
         elif self.current_state == MetabolicState.DREAM:
             # DREAM → WAKE: ATP recovered, consolidation complete
             # Harder to leave dream at night
-            # In simulation mode, use cycle counts (e.g., 18 cycles max)
+            # Threshold in cycles (unified sim/real — Thor 2026-04-11 12:00 Dream Gap fix)
             wake_threshold = 70.0 * wake_bias
-            max_dream_time = (18 / dream_bias) if self.simulation_mode else (180 / dream_bias)
+            max_dream_time = 18 / dream_bias
             if self.atp_current > wake_threshold or time_in_state > max_dream_time:
                 return MetabolicState.WAKE
 
@@ -423,3 +439,23 @@ class MetabolicController:
     def get_sensor_poll_rate(self) -> float:
         """Get sensor polling rate for current state"""
         return self.get_current_config().sensor_poll_rate
+
+    def get_metabolic_snapshot(self) -> Dict:
+        """
+        Get current metabolic state snapshot for experience logging.
+
+        Thor Session #60: ATP logging for Gnosis C≈0.5 validation.
+        This enables testing Prediction #3 (energy coupling α).
+
+        Returns:
+            Dict with current ATP, state, and transition count
+        """
+        return {
+            'state': self.current_state.value,
+            'atp_current': round(self.atp_current, 2),
+            'atp_max': self.atp_max,
+            'atp_percentage': round((self.atp_current / self.atp_max) * 100, 1),
+            'cycles_in_state': self.cycles_in_state,
+            'total_cycles': self.total_cycles,
+            'transition_count': len(self.state_history)
+        }

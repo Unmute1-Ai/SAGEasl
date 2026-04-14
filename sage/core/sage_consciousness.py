@@ -234,6 +234,8 @@ class SAGEConsciousness:
         self.irp_memory = []    # IRP pattern library
         self.circular_buffer = []  # Recent context (x-from-last)
         self.verbatim_storage = []  # Full-fidelity records
+        self._dream_watermark = 0  # Index into snarc_memory: last consolidated position
+        self.dream_knowledge = None  # Loaded from dream bundles on WAKE entry
 
         # Trust weights for plugins — defensive: start at zero, earn from evidence
         self.plugin_trust_weights = {
@@ -271,7 +273,11 @@ class SAGEConsciousness:
         try:
             from sage.instances.sleep_capability import SleepCapability
             instance_dir = Path(self.config.get('instance_dir', ''))
-            self.sleep_cap = SleepCapability.detect(instance_dir if instance_dir.name else None)
+            model_path = self.config.get('sleep_model_path') or self.config.get('model_name', '')
+            self.sleep_cap = SleepCapability.detect(
+                instance_dir if instance_dir.name else None,
+                model_path=model_path,
+            )
             print(f"[Sleep] Capability: lora={self.sleep_cap.sleep_lora} "
                   f"jsonl={self.sleep_cap.sleep_jsonl} remote={self.sleep_cap.sleep_remote} "
                   f"→ best={self.sleep_cap.best_mode}")
@@ -811,6 +817,15 @@ class SAGEConsciousness:
                 if self.cycle_count % 100 == 0 and self.cycle_count > 0:
                     self._update_policygate_trust_weights()
 
+                # C ≈ 0.5 Validation Logging (Thor Session #52)
+                if self.cycle_count % 100 == 0 and self.cycle_count > 0:
+                    # Experiments 1 and 6: Trust distribution and coherence
+                    try:
+                        self.log_trust_distribution(self.cycle_count)
+                        self.log_coherence(self.cycle_count)
+                    except Exception as e:
+                        print(f"[Validation] Logging error (non-fatal): {e}")
+
                 # Periodic status
                 if self.cycle_count % 10 == 0:
                     self._print_status()
@@ -875,6 +890,10 @@ class SAGEConsciousness:
             # Sleep consolidation hook — log readiness on DREAM entry
             if self.metabolic.current_state == MetabolicState.DREAM:
                 self._on_dream_entry()
+
+            # Dream knowledge consumption hook — load dream insights on WAKE entry
+            if self.metabolic.current_state == MetabolicState.WAKE and previous_state == MetabolicState.DREAM:
+                self._on_wake_from_dream()
 
         # 3.5 Compute trust posture (trust landscape → behavioral strategy)
         self.current_posture = self._compute_trust_posture()
@@ -981,6 +1000,22 @@ class SAGEConsciousness:
             self.stats['average_salience'] = (
                 0.9 * self.stats['average_salience'] + 0.1 * avg_salience
             )
+            self.stats['max_salience'] = max(s.total for s in salience_map.values())
+
+        # 11. C ≈ 0.5 Validation Logging (Thor Session #52)
+        # Log metabolic state every cycle (Experiment 2)
+        try:
+            self.log_metabolic_state(self.cycle_count)
+        except Exception:
+            pass  # Non-fatal logging error
+
+        # Log salience scores every cycle (Experiment 3)
+        if salience_map:
+            try:
+                salience_list = list(salience_map.values())
+                self.log_salience_scores(self.cycle_count, salience_list)
+            except Exception:
+                pass  # Non-fatal logging error
 
     def _gather_observations(self) -> List[SensorObservation]:
         """
@@ -1597,6 +1632,7 @@ class SAGEConsciousness:
         return PluginResult(
             plugin_name='language',
             final_state={
+                'prompt': content[:500],
                 'response': response_text,
                 'message_id': message_id,
                 'sender': sender,
@@ -2059,6 +2095,17 @@ class SAGEConsciousness:
                 " in unexpected directions. This is exploration, not evaluation."
             )
 
+        # Dream knowledge injection — insights from recent DREAM consolidation
+        if self.dream_knowledge and self.dream_knowledge.get('high_salience_previews'):
+            dk = self.dream_knowledge
+            dream_text = (
+                f"\n\nDREAM INSIGHTS (from {dk['bundles_read']} recent consolidation cycles, "
+                f"{dk['total_experiences']} experiences):"
+            )
+            for preview in dk['high_salience_previews'][:3]:
+                dream_text += f"\n- {preview[:200]}"
+            parts.append(dream_text)
+
         # Clear separator before conversation
         parts.append("\n---\n")
 
@@ -2091,24 +2138,42 @@ class SAGEConsciousness:
             except Exception as e:
                 print(f"[DREAM] Experience check failed: {e}")
 
-        if not self.snarc_memory:
-            print(f"[DREAM] No SNARC memories to consolidate")
+        # Only consolidate experiences accumulated since last DREAM entry.
+        # Before this fix, every DREAM wrote the entire snarc_memory list,
+        # producing monotonically growing duplicate bundles.
+        new_experiences = self.snarc_memory[self._dream_watermark:]
+        if not new_experiences:
+            print(f"[DREAM] No new SNARC memories since last consolidation "
+                  f"(watermark={self._dream_watermark}, total={len(self.snarc_memory)})")
             return
+
+        # Advance watermark — these experiences are now consolidated
+        self._dream_watermark = len(self.snarc_memory)
 
         # Tiered sleep consolidation based on detected capability
         mode = self.sleep_cap.best_mode if self.sleep_cap else 'jsonl'
 
         # Tier 1: Real LoRA consolidation
+        # Check bridge.enabled synchronously before launching async task —
+        # previously, ensure_future() + return meant JSONL fallback never ran
+        # when the bridge self-disabled (SLEEP_TRAINING_AVAILABLE was False).
         if mode == 'lora' and self.use_real_sleep and self.sleep_bridge:
-            try:
-                buffer_adapter = _SleepBufferAdapter(self.snarc_memory)
-                asyncio.ensure_future(self._run_sleep_consolidation(buffer_adapter))
-                if self.sleep_cap:
-                    self.sleep_cap.record_consolidation('lora')
-                return
-            except Exception as e:
-                print(f"[DREAM] LoRA consolidation failed, falling back to JSONL: {e}")
+            if not getattr(self.sleep_bridge, 'enabled', False):
+                print(f"[DREAM] LoRA bridge disabled, falling back to JSONL")
                 mode = 'jsonl'
+            else:
+                try:
+                    buffer_adapter = _SleepBufferAdapter(new_experiences)
+                    asyncio.ensure_future(self._run_sleep_consolidation(buffer_adapter))
+                    if self.sleep_cap:
+                        self.sleep_cap.record_consolidation('lora')
+                    # Don't return — also write JSONL as safety net.
+                    # LoRA runs async and may fail (e.g. missing model weights);
+                    # JSONL ensures dream data is always persisted.
+                    mode = 'jsonl'
+                except Exception as e:
+                    print(f"[DREAM] LoRA consolidation failed, falling back to JSONL: {e}")
+                    mode = 'jsonl'
 
         # Tier 2: Dream bundle (JSONL) — write to instance dir
         if mode in ('jsonl', 'remote'):
@@ -2120,18 +2185,19 @@ class SAGEConsciousness:
                     from sage.instances.sleep_capability import write_dream_bundle
                     bundle_path = write_dream_bundle(
                         instance_dir=instance_dir,
-                        experiences=self.snarc_memory,
+                        experiences=new_experiences,
                         machine=self.config.get('machine_name', 'unknown'),
                         model=self.config.get('model_name', 'unknown'),
                     )
                     print(f"[DREAM] Dream bundle: {bundle_path.name} "
-                          f"({len(self.snarc_memory)} experiences)")
+                          f"({len(new_experiences)} new experiences, "
+                          f"{len(self.snarc_memory)} total)")
                 else:
                     # Fallback: write to demo_logs if no instance dir
                     consolidation_file = Path('demo_logs') / 'consolidated_memory.jsonl'
                     consolidation_file.parent.mkdir(exist_ok=True)
                     sorted_exp = sorted(
-                        self.snarc_memory,
+                        new_experiences,
                         key=lambda x: x.get('salience', 0),
                         reverse=True,
                     )[:10]
@@ -2158,6 +2224,37 @@ class SAGEConsciousness:
                     self.sleep_cap.record_consolidation(mode)
             except Exception as e:
                 print(f"[DREAM] Consolidation failed: {e}")
+
+    def _on_wake_from_dream(self):
+        """Hook called when consciousness transitions from DREAM → WAKE.
+
+        Consumes dream bundles written during DREAM state, extracting
+        salience statistics, high-value experience patterns, and response
+        themes to inform the next WAKE cycle.
+
+        This closes the dream consolidation loop:
+            WAKE (accumulate) → DREAM (write bundles) → WAKE (consume bundles)
+        """
+        instance_dir_str = self.config.get('instance_dir', '')
+        instance_dir = Path(instance_dir_str) if instance_dir_str else None
+
+        if not instance_dir or not instance_dir.exists():
+            return
+
+        try:
+            from sage.instances.sleep_capability import read_dream_bundles
+            knowledge = read_dream_bundles(instance_dir, max_bundles=5)
+            if knowledge:
+                self.dream_knowledge = knowledge
+                print(f"[WAKE] Dream knowledge loaded: {knowledge['total_experiences']} experiences "
+                      f"from {knowledge['bundles_read']} bundles, "
+                      f"salience range [{knowledge['salience_min']:.3f}-{knowledge['salience_max']:.3f}]")
+                if knowledge.get('high_salience_previews'):
+                    print(f"[WAKE] {len(knowledge['high_salience_previews'])} high-salience insights available")
+            else:
+                print(f"[WAKE] No dream bundles found to consume")
+        except Exception as e:
+            print(f"[WAKE] Dream bundle consumption failed: {e}")
 
     async def _run_sleep_consolidation(self, buffer_adapter):
         """Run real sleep consolidation asynchronously."""
@@ -2297,17 +2394,29 @@ class SAGEConsciousness:
             telemetry = result.telemetry
 
             # 1. SNARC memory (selective storage via salience)
+            # Skip mock-executed plugins — they have no real content to consolidate
+            # and pollute dream bundles with uniform meaningless scores (Bug #7)
+            is_mock = telemetry.get('trust', {}).get('mock', False)
             snarc_real = telemetry.get('snarc_real', None)
             salience = snarc_real['total'] if snarc_real else telemetry.get('salience', 0.0)
-            if salience > self.salience_threshold:
+            if salience > self.salience_threshold and not is_mock:
                 entry = {
                     'cycle': self.cycle_count,
                     'plugin': plugin_name,
                     'salience': salience,
+                    'ts': time.time(),
                     'result': result,
+                    'scored_real': snarc_real is not None,
                 }
                 if snarc_real:
                     entry['snarc_dimensions'] = snarc_real
+                # Extract conversation source for dream bundle enrichment
+                if hasattr(result, 'final_state') and isinstance(result.final_state, dict):
+                    fs = result.final_state
+                    prompt = fs.get('prompt', '') or ''
+                    response = fs.get('response', '') or ''
+                    if prompt or response:
+                        entry['source'] = f"{prompt[:200]}|{response[:300]}"
                 self.snarc_memory.append(entry)
 
             # 2. IRP pattern library (store good convergence patterns)
@@ -2404,9 +2513,163 @@ class SAGEConsciousness:
               f"Posture: {posture:10s} "
               f"ATP: {self.metabolic.atp_current:5.1f}/{self.metabolic.atp_max:.0f} "
               f"Salience: {self.stats['average_salience']:.3f} "
+              f"MaxSal: {self.stats.get('max_salience', 0.0):.3f} "
               f"Plugins: {self.stats['plugins_executed']}")
         print(f"         Plugin trust: {plugin_trust_str}")
         print(f"         Sensor trust: {sensor_trust_str}")
+
+    # =========================================================================
+    # C ≈ 0.5 Empirical Validation Logging (Thor Session #52)
+    # =========================================================================
+
+    def log_trust_distribution(self, cycle_num: int):
+        """
+        Log trust weight distribution for Experiment 1.
+
+        Hypothesis: Mean trust ~0.5-0.7, std ~0.15-0.25
+        Called every 100 cycles to track trust weight evolution.
+        """
+        weights = list(self.plugin_trust_weights.values())
+        if not weights:
+            return
+
+        stats = {
+            'cycle': cycle_num,
+            'mean': float(np.mean(weights)),
+            'std': float(np.std(weights)),
+            'min': float(np.min(weights)),
+            'max': float(np.max(weights)),
+            'weights': {k: float(v) for k, v in self.plugin_trust_weights.items()}
+        }
+
+        log_path = Path('validation_logs/trust_distribution_log.jsonl')
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(stats) + '\n')
+
+    def log_metabolic_state(self, cycle_num: int):
+        """
+        Log metabolic state for Experiment 2.
+
+        Hypothesis: WAKE ~60-70%, average C_system ≈ 0.5
+        Called every cycle.
+        """
+        state_log = {
+            'cycle': cycle_num,
+            'state': self.metabolic.current_state.value,
+            'atp': float(self.metabolic.atp_current),
+            'salience': float(self.stats.get('average_salience', 0.0))
+        }
+
+        log_path = Path('validation_logs/metabolic_state_log.jsonl')
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(state_log) + '\n')
+
+    def log_salience_scores(self, cycle_num: int, salience_scores: List[SalienceScore]):
+        """
+        Log SNARC salience distribution for Experiment 3.
+
+        Hypothesis: Mean ~0.4-0.6, unimodal distribution
+        Called every cycle when salience scores available.
+        """
+        if not salience_scores:
+            return
+
+        log_entry = {
+            'cycle': cycle_num,
+            'salience_total': [float(s.total) for s in salience_scores],
+            'salience_components': [
+                {
+                    'surprise': float(s.surprise),
+                    'novelty': float(s.novelty),
+                    'arousal': float(s.arousal),
+                    'reward': float(s.reward),
+                    'conflict': float(s.conflict)
+                } for s in salience_scores
+            ]
+        }
+
+        log_path = Path('validation_logs/salience_log.jsonl')
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+
+    def compute_system_coherence(self) -> Dict[str, float]:
+        """
+        Estimate overall system coherence from multiple subsystems.
+
+        Returns dict with c_system and component coherences.
+        For Experiment 6: Direct coherence measurement.
+        """
+        # C1: Trust weights (mean of weights)
+        weights = list(self.plugin_trust_weights.values())
+        c_trust = float(np.mean(weights)) if weights else 0.5
+
+        # C2: Metabolic state (mapped value)
+        state_to_c = {
+            MetabolicState.WAKE: 0.5,
+            MetabolicState.REST: 0.3,
+            MetabolicState.DREAM: 0.7,
+            MetabolicState.CRISIS: 0.9
+        }
+        c_metabolic = state_to_c.get(self.metabolic.current_state, 0.5)
+
+        # C3: Salience (1 - avg_salience, high salience = low coherence with expectations)
+        avg_sal = self.stats.get('average_salience', 0.5)
+        c_salience = 1.0 - avg_sal  # Invert: high salience = surprising = low coherence
+
+        # C4: ATP allocation diversity (std of allocations / mean)
+        # Higher diversity = more flexibility = closer to C=0.5
+        if hasattr(self, 'last_atp_allocations') and self.last_atp_allocations:
+            allocs = list(self.last_atp_allocations.values())
+            if len(allocs) > 1:
+                mean_alloc = np.mean(allocs)
+                if mean_alloc > 1e-6:
+                    cv = float(np.std(allocs)) / mean_alloc  # Coefficient of variation
+                    # Map CV to coherence: CV=0 → C=1 (rigid), CV=high → C=0.5 (diverse)
+                    c_atp = max(0.3, 1.0 - cv)
+                else:
+                    c_atp = 0.5
+            else:
+                c_atp = 0.5
+        else:
+            c_atp = 0.5
+
+        # Weighted average (trust and metabolic most reliable)
+        c_system = (
+            0.35 * c_trust +
+            0.35 * c_metabolic +
+            0.15 * c_salience +
+            0.15 * c_atp
+        )
+
+        return {
+            'c_system': float(c_system),
+            'c_trust': float(c_trust),
+            'c_metabolic': float(c_metabolic),
+            'c_salience': float(c_salience),
+            'c_atp': float(c_atp)
+        }
+
+    def log_coherence(self, cycle_num: int):
+        """
+        Log system coherence for Experiment 6.
+
+        Hypothesis: C_system ≈ 0.5 ± 0.1
+        Called every 100 cycles.
+        """
+        c_vals = self.compute_system_coherence()
+        c_vals['cycle'] = cycle_num
+
+        log_path = Path('validation_logs/coherence_log.jsonl')
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(c_vals) + '\n')
+
+    # =========================================================================
+    # End C ≈ 0.5 Validation Logging
+    # =========================================================================
 
     def _print_summary(self):
         """Print final summary statistics"""

@@ -9,6 +9,7 @@ Transport-agnostic: works with direct push (embedded/competition), MCP
 tools (orchestration), or REST (development).
 """
 
+import base64
 import time
 import threading
 import numpy as np
@@ -47,6 +48,65 @@ class GridObservation:
     # Optional perception notes
     perception_notes: Optional[str] = None
 
+    # Cognitive classification — set by SAGE when writing step_record back to cartridge.
+    # Andy's cartridge layer uses this to tag the h-row for prioritized cross-level search.
+    # Values: None (routine step), "reflection" (hypothesis+strategy+key_insight),
+    #         "discovery" (novel pattern first seen), "goal_update" (objective revision)
+    cognitive_type: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to JSON-safe dict. Compatible with Andy's GridObservation.to_dict().
+
+        embedding → base64-encoded float32 bytes (matches membot/vision/grid_observation.py)
+        frame_raw → nested lists of ints
+        """
+        result: Dict[str, Any] = {
+            "frame_raw": self.frame_raw.tolist(),
+            "objects": self.objects,
+            "changes": self.changes,
+            "moved": self.moved,
+            "step_number": self.step_number,
+            "action_taken": self.action_taken,
+            "level_id": self.level_id,
+            "perception_notes": self.perception_notes,
+            "cognitive_type": self.cognitive_type,
+        }
+        if self.embedding is not None:
+            result["embedding"] = base64.b64encode(
+                self.embedding.astype(np.float32).tobytes()
+            ).decode("ascii")
+            result["embedding_shape"] = list(self.embedding.shape)
+        else:
+            result["embedding"] = None
+            result["embedding_shape"] = None
+        return result
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "GridObservation":
+        """Deserialize from JSON-safe dict. Inverse of to_dict().
+
+        Restores numpy arrays from serialized forms.
+        """
+        embedding = None
+        if d.get("embedding") is not None:
+            raw = base64.b64decode(d["embedding"])
+            embedding = np.frombuffer(raw, dtype=np.float32).copy()
+            shape = d.get("embedding_shape")
+            if shape and len(shape) > 1:
+                embedding = embedding.reshape(shape)
+        return cls(
+            frame_raw=np.array(d["frame_raw"], dtype=np.uint8),
+            objects=d.get("objects", []),
+            changes=d.get("changes", []),
+            moved=d.get("moved", []),
+            embedding=embedding,
+            step_number=d.get("step_number", 0),
+            action_taken=d.get("action_taken", 0),
+            level_id=d.get("level_id", ""),
+            perception_notes=d.get("perception_notes"),
+            cognitive_type=d.get("cognitive_type"),
+        )
+
     @property
     def change_magnitude(self) -> float:
         """Normalized count of cells that changed. [0, 1]."""
@@ -61,6 +121,73 @@ class GridObservation:
     @property
     def n_moved(self) -> int:
         return len(self.moved)
+
+
+@dataclass
+class StepRecord:
+    """What SAGE writes back to Andy's cartridge (odd-pattern rows).
+
+    Andy's perception layer writes even-pattern rows (frame + embedding + objects).
+    SAGE writes odd-pattern rows (this struct) after each action decision.
+
+    cognitive_type drives Andy's h-row tagging for prioritized cross-level search:
+      None        → routine step (most common)
+      "reflection" → deep reflection (hypothesis + strategy + key_insight) — HIGH PRIORITY
+      "discovery"  → novel pattern first observed in this session
+      "goal_update" → SAGE revised its objective mid-level
+    """
+    step: int
+    action_taken: int                   # 1-5
+    action_rationale: str               # human-readable reason
+    salience: Dict[str, float]          # {surprise, novelty, arousal, reward, conflict}
+    metabolic_state: str                # FOCUS / EXPLORE / CONSERVE / etc.
+    atp_spent: float
+    trust_posture: Dict[str, Any]       # {confidence, dominant_modality, label}
+    policy_gate: str                    # "approved" / "blocked: <reason>"
+    timestamp: float
+
+    # Reasoning (set when reasoning plugin fires — not every step)
+    reasoning_text: Optional[str] = None
+    hypothesis: Optional[str] = None
+    strategy: Optional[str] = None
+    key_insight: Optional[str] = None
+
+    # Cognitive flag for Andy's cartridge h-row
+    cognitive_type: Optional[str] = None  # see class docstring
+
+    level_id: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to JSON-safe dict for cartridge odd-pattern write."""
+        return {
+            "step": self.step,
+            "action_taken": self.action_taken,
+            "action_rationale": self.action_rationale,
+            "salience": self.salience,
+            "metabolic_state": self.metabolic_state,
+            "atp_spent": self.atp_spent,
+            "trust_posture": self.trust_posture,
+            "policy_gate": self.policy_gate,
+            "timestamp": self.timestamp,
+            "reasoning_text": self.reasoning_text,
+            "hypothesis": self.hypothesis,
+            "strategy": self.strategy,
+            "key_insight": self.key_insight,
+            "cognitive_type": self.cognitive_type,
+            "level_id": self.level_id,
+        }
+
+    @property
+    def is_deep_reflection(self) -> bool:
+        """True if this record contains a full hypothesis+strategy+insight triple."""
+        return bool(self.hypothesis and self.strategy and self.key_insight)
+
+    def auto_tag_cognitive_type(self) -> None:
+        """Set cognitive_type based on content if not already set."""
+        if self.cognitive_type is not None:
+            return
+        if self.is_deep_reflection:
+            self.cognitive_type = "reflection"
 
 
 class GridVisionIRP(IRPPlugin):
@@ -269,6 +396,178 @@ class GridVisionIRP(IRPPlugin):
             "timestamp": time.time(),
             "trust": self.trust_weight,
         }
+
+    # --- Scene Description (code → text vision for non-multimodal models) ---
+
+    def describe_scene(self, obs: Optional[GridObservation] = None) -> str:
+        """Produce a natural language scene description from the current frame.
+
+        This is the Vision IRP's core contribution: translating a raw grid
+        into text that a non-multimodal LLM can reason about spatially.
+
+        Layers of description:
+          1. Grid composition — what colors are present, how much of each
+          2. Spatial layout — where are the major regions
+          3. Object roles — classify detected objects by likely function
+          4. State assessment — what looks interactive, what's decorative
+          5. Comparison — if template/target regions detected, describe match
+        """
+        if obs is None:
+            obs = self.get_latest()
+        if obs is None:
+            return "(no frame available)"
+
+        grid = obs.frame_raw
+        if grid is None or grid.size == 0:
+            return "(empty frame)"
+
+        h, w = grid.shape[:2]
+        parts = []
+
+        # --- Color composition ---
+        flat = grid.ravel().astype(int)
+        counts = np.bincount(flat, minlength=16)
+        total = h * w
+        bg_color = int(np.argmax(counts))
+        bg_pct = counts[bg_color] / total * 100
+
+        COLOR_NAMES = ["black", "blue", "red", "green", "yellow", "gray",
+                       "magenta", "orange", "cyan", "brown", "pink", "maroon",
+                       "olive", "navy", "teal", "white"]
+
+        non_bg = [(c, int(counts[c])) for c in range(16) if c != bg_color and counts[c] > 0]
+        non_bg.sort(key=lambda x: -x[1])
+
+        parts.append(f"Grid: {w}x{h}. Background: {COLOR_NAMES[bg_color]} ({bg_pct:.0f}%).")
+        if non_bg:
+            color_desc = ", ".join(f"{COLOR_NAMES[c]}({n}px, {n/total*100:.0f}%)" for c, n in non_bg[:6])
+            parts.append(f"Colors present: {color_desc}")
+
+        # --- Spatial layout: divide into quadrants ---
+        mid_r, mid_c = h // 2, w // 2
+        quadrants = {
+            "top-left": grid[:mid_r, :mid_c],
+            "top-right": grid[:mid_r, mid_c:],
+            "bottom-left": grid[mid_r:, :mid_c],
+            "bottom-right": grid[mid_r:, mid_c:],
+        }
+        # Also check edges for UI elements (palettes, score bars)
+        edges = {
+            "top-strip": grid[:4, :],
+            "bottom-strip": grid[-4:, :],
+            "left-strip": grid[:, :4],
+            "right-strip": grid[:, -4:],
+        }
+
+        # Describe quadrant dominant colors (non-background)
+        quad_desc = []
+        for name, region in quadrants.items():
+            r_flat = region.ravel().astype(int)
+            r_counts = np.bincount(r_flat, minlength=16)
+            r_counts[bg_color] = 0  # ignore background
+            dominant = int(np.argmax(r_counts))
+            if r_counts[dominant] > 0:
+                pct = r_counts[dominant] / region.size * 100
+                quad_desc.append(f"{name}: mostly {COLOR_NAMES[dominant]} ({pct:.0f}%)")
+        if quad_desc:
+            parts.append(f"Layout: {'; '.join(quad_desc)}")
+
+        # Check for edge UI elements (score bars, palettes)
+        for name, strip in edges.items():
+            s_flat = strip.ravel().astype(int)
+            s_counts = np.bincount(s_flat, minlength=16)
+            s_counts[bg_color] = 0
+            unique_colors = sum(1 for c in range(16) if s_counts[c] > 5)
+            if unique_colors >= 3:
+                colors = [COLOR_NAMES[c] for c in range(16) if s_counts[c] > 5]
+                parts.append(f"{name}: multi-colored strip ({', '.join(colors[:5])}) — possible palette or UI")
+
+        # --- Object role classification ---
+        if obs.objects:
+            small_edge = []   # small objects near edges = buttons/palette
+            small_center = [] # small objects in center = interactive game elements
+            large_center = [] # large objects in center = canvas/playfield
+            large_edge = []   # large objects near edge = template/reference
+
+            for obj in obs.objects:
+                bbox = obj.get("bbox", [0, 0, h-1, w-1])
+                centroid = obj.get("centroid", [h//2, w//2])
+                size = obj.get("size", 0)
+                cr, cc = centroid[0], centroid[1]
+                near_edge = cr < 8 or cr > h-8 or cc < 8 or cc > w-8
+
+                if size <= 64:
+                    if near_edge:
+                        small_edge.append(obj)
+                    else:
+                        small_center.append(obj)
+                else:
+                    if near_edge:
+                        large_edge.append(obj)
+                    else:
+                        large_center.append(obj)
+
+            if small_edge:
+                names = [f"{COLOR_NAMES[o.get('color', 0) % 16]}@({o.get('centroid', [0,0])[1]},{o.get('centroid', [0,0])[0]})"
+                         for o in small_edge[:6]]
+                parts.append(f"Edge objects ({len(small_edge)}, likely buttons/palette): {', '.join(names)}")
+
+            if small_center:
+                names = [f"{COLOR_NAMES[o.get('color', 0) % 16]}@({o.get('centroid', [0,0])[1]},{o.get('centroid', [0,0])[0]})"
+                         for o in small_center[:6]]
+                parts.append(f"Center objects ({len(small_center)}, likely interactive): {', '.join(names)}")
+
+            if large_center:
+                for obj in large_center[:2]:
+                    bbox = obj.get("bbox", [0,0,0,0])
+                    sz = obj.get("size", 0)
+                    c = COLOR_NAMES[obj.get("color", 0) % 16]
+                    parts.append(f"Large center region: {c}, {sz}px, bbox=({bbox[1]},{bbox[0]})-({bbox[3]},{bbox[2]}) — possible canvas/playfield")
+
+            if large_edge:
+                for obj in large_edge[:2]:
+                    bbox = obj.get("bbox", [0,0,0,0])
+                    sz = obj.get("size", 0)
+                    c = COLOR_NAMES[obj.get("color", 0) % 16]
+                    parts.append(f"Large edge region: {c}, {sz}px — possible template/reference")
+
+        # --- Symmetry and pattern detection ---
+        # Check if center has a distinct region (common in puzzles)
+        center_region = grid[mid_r-8:mid_r+8, mid_c-8:mid_c+8]
+        center_colors = set(int(c) for c in center_region.ravel() if c != bg_color)
+        if len(center_colors) >= 3:
+            parts.append(f"Center region has {len(center_colors)} colors — likely the main game element")
+
+        # Check for repeating patterns (palette-like rows/columns)
+        for row in range(0, h, 8):
+            strip = grid[row:row+4, :]
+            unique = len(set(int(c) for c in strip.ravel() if c != bg_color))
+            if unique >= 4:
+                colors = [COLOR_NAMES[c] for c in sorted(set(int(c) for c in strip.ravel() if c != bg_color))[:6]]
+                parts.append(f"Row {row}: multi-colored ({', '.join(colors)}) — possible palette or indicator")
+                break  # only report the first one
+
+        # --- Frame diff summary (what just happened) ---
+        if obs.changes:
+            n = len(obs.changes)
+            changed_colors_new = set(c["now"] for c in obs.changes[:100])
+            changed_colors_old = set(c["was"] for c in obs.changes[:100])
+            new_names = [COLOR_NAMES[c % 16] for c in changed_colors_new if c != bg_color]
+            old_names = [COLOR_NAMES[c % 16] for c in changed_colors_old if c != bg_color]
+
+            if n <= 4:
+                parts.append(f"Last action: {n}px changed (tiny — cursor move or selection)")
+            elif n <= 50:
+                parts.append(f"Last action: {n}px changed ({', '.join(old_names[:3])} → {', '.join(new_names[:3])})")
+            else:
+                parts.append(f"Last action: {n}px changed (large — major state change: {', '.join(old_names[:3])} → {', '.join(new_names[:3])})")
+
+        if obs.moved:
+            for m in obs.moved[:3]:
+                delta = m.get("delta", [0, 0])
+                parts.append(f"Object moved: Δ({delta[1]},{delta[0]})")
+
+        return "\n".join(parts)
 
     @property
     def stats(self) -> Dict[str, Any]:

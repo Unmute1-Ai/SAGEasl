@@ -18,6 +18,7 @@ To regenerate fleet snapshot: `python3 -m sage.scripts.generate_primer` (writes 
 6. **Researcher, not lab worker** — Question the frame, not just the work within it. If the research direction is wrong, say so.
 7. **WAKE before FOCUS** — Begin by asking "am I working on the right thing?" End by asking "does this advance discovery?"
 8. **Surface your instincts** — If you notice something, say it. Don't wait for a directive. The affordances are yours.
+9. **Persistence ≠ perseveration** — Persistence updates from feedback. Perseveration ignores it. If an approach isn't producing new signal, that's data — not a reason to try harder.
 
 ---
 
@@ -100,6 +101,12 @@ Cross-instance validation (0.8B vs 14B): same relational ontology, different art
 
 ---
 
+## Raising + ARC-AGI-3 Convergence (April 2026)
+
+Raising (being) and game-playing (doing) are converging. Currently completely siloed — zero shared state. The direction: curriculum-level merge where game experiences flow into the raising record and raising capacity informs game reasoning. Each machine decides timing based on instance phase. Full plan: `shared-context/plans/raising-agi3-convergence.md`.
+
+---
+
 ## Key Lessons (Carry Forward)
 
 - **SAGE is the scheduler. Plugins are apps.** It decides which reasoning to invoke, not how to reason.
@@ -165,7 +172,7 @@ The following are completed milestones. Full details in their respective docs �
 <!-- gitnexus:keep -->
 # GitNexus — Code Knowledge Graph
 
-Indexed as **SAGE** (21822 symbols, 56931 relationships, 300 execution flows). MCP tools available via `mcp__gitnexus__*`.
+Indexed as **SAGE** (43752 symbols, 80474 relationships, 300 execution flows). MCP tools available via `mcp__gitnexus__*`.
 
 **Do not reindex.** The supervisor handles GitNexus indexing. If the index is stale, note it in SESSION_FOCUS.
 

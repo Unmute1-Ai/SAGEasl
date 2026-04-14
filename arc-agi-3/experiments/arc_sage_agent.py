@@ -52,6 +52,20 @@ try:
 except ImportError:
     HAS_SPATIAL = False
 
+# GameKnowledgeBase — persistent lived experience across runs
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "sage", "irp", "plugins"))
+try:
+    from game_knowledge_base import GameKnowledgeBase
+    HAS_KB = True
+except ImportError:
+    HAS_KB = False
+
+try:
+    from arc_visualize import save_frame, save_annotated_frame, save_game_summary
+    HAS_VIZ = True
+except ImportError:
+    HAS_VIZ = False
+
 INT_TO_GAME_ACTION = {a.value: a for a in GameAction}
 MEMBOT_URL = "http://localhost:8000"
 SAGE_URL = "http://localhost:8750"  # SAGE daemon for LLM reasoning
@@ -88,7 +102,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:0.8b")
 
 
-def sage_reason(prompt, system_prompt=None, max_tokens=150):
+def sage_reason(prompt, system_prompt=None, max_tokens=-1):
     """Ask LLM to reason about the game state.
 
     Uses Ollama chat API directly with system+user message separation.
@@ -560,7 +574,7 @@ def build_strategy_prompt(grid, available_actions, memories, level_info,
                           cycle_info=None, spatial_tracker=None,
                           goal_similarity=None, cursor_pos=None,
                           prev_grid=None, last_action_desc=None,
-                          action_history=None):
+                          action_history=None, kb_context=None):
     """Build a situational briefing for the LLM.
 
     The model is a player looking at a game screen. It controls a cursor.
@@ -610,6 +624,12 @@ def build_strategy_prompt(grid, available_actions, memories, level_info,
     if exploration_summary:
         prompt_parts.append(exploration_summary)
 
+    # ── What you know from prior sessions (KB) ──
+    if kb_context:
+        # Curated KB — only the most actionable lines, not the full dump
+        # Keep it under 200 chars to not overwhelm 0.8B context
+        prompt_parts.append(kb_context[:200])
+
     # ── What you see on screen ──
     regions = find_color_regions(grid, min_size=4)
     non_bg_regions = [r for r in regions if r["color"] != bg]
@@ -653,11 +673,20 @@ def build_strategy_prompt(grid, available_actions, memories, level_info,
 # ─── Fallback heuristic (no LLM needed) ───
 
 def heuristic_action(grid, available_actions, category, step_count,
-                     effective_actions=None, color_effectiveness=None):
+                     effective_actions=None, color_effectiveness=None,
+                     banned_actions=None):
     """Fallback action when LLM is unavailable or response unparseable.
 
     Uses perception-based heuristics informed by exploration results.
     """
+    # Filter out banned actions from available set
+    orig_actions = list(available_actions)
+    if banned_actions:
+        available_actions = [a for a in available_actions
+                             if str(a) not in banned_actions]
+        if not available_actions:
+            # All actions banned — use originals minus submit as last resort
+            available_actions = [a for a in orig_actions if a != 5] or orig_actions
     bg = background_color(grid)
 
     if category.get("category") == "placement_puzzle" and 6 in available_actions:
@@ -826,6 +855,9 @@ class SageAgent:
         self.banned_actions = {}  # action_key → steps_remaining
         self.recent_action_keys = deque(maxlen=10)  # Last 10 action keys for pattern detection
         self.total_cycles = 0  # Never resets — escalates over game lifetime
+
+        # Click data tracking (for KB solution recording)
+        self.click_data_history = []  # [(action_int, data_dict_or_None), ...]
 
     @staticmethod
     def _action_key(actions):
@@ -1128,6 +1160,14 @@ class SageAgent:
         if self.verbose:
             print(f"  Visual memory: initialized for {prefix}")
 
+        # VISUALIZATION: Save frames to disk for inspection
+        viz_dir = os.path.join(os.path.dirname(__file__), "viz", prefix)
+        if HAS_VIZ:
+            save_frame(grid, os.path.join(viz_dir, "00_initial.png"))
+            self._viz_frames = [grid.copy()]  # Collect key frames for summary
+            self._viz_labels = ["initial"]
+            self._viz_dir = viz_dir
+
         # GOAL DETECTION: Track similarity to initial state
         goal_similarity = 1.0  # Start at initial state
         goal_history = [1.0]  # Track similarity over time
@@ -1153,6 +1193,18 @@ class SageAgent:
         if self.verbose:
             print(f"  Category: {category.get('category', '?')} — {category.get('hint', '')}")
 
+        # KNOWLEDGE BASE: Load persistent game knowledge (fleet-contributed)
+        kb = None
+        if HAS_KB:
+            kb = GameKnowledgeBase(prefix)
+            kb.load()
+            kb.session_count += 1
+            kb.decay_stale_solutions()
+            if self.verbose:
+                s = kb.stats
+                print(f"  KB: session {s['session_count']}, {s['n_objects']} objects, "
+                      f"{s['n_solutions']} solutions, best L{s['best_level']}")
+
         # SPATIAL TRACKING: Initialize object tracker
         if HAS_SPATIAL:
             self.spatial_tracker = SpatialTracker(min_region_size=4)
@@ -1170,10 +1222,64 @@ class SageAgent:
         else:
             steps_used = 0
 
+        # Feed exploration results to KB
+        if kb:
+            for cname, stats in self.color_effectiveness.items():
+                # Record each probed color as an effect
+                for ea in self.effective_actions:
+                    if ea.get("color") == cname and "pos" in ea:
+                        px, py = ea["pos"]
+                        kb.record_click_effect(
+                            r=py, c=px, color=cname,
+                            cells_changed=stats["changes"],
+                            level_up=False, level=0)
+            # Record direction outcomes as mechanics
+            for key, outcome in self.outcome_map.items():
+                if key.startswith("action_") and outcome.get("changed"):
+                    name = key.replace("action_", "")
+                    n_px = outcome.get("n_pixels", 0)
+                    kb.add_mechanic(f"{name}: {n_px}px change")
+
         # Check if exploration already solved levels
         best_levels = fd.levels_completed
         if best_levels > 0 and self.verbose:
             print(f"  Exploration solved {best_levels} level(s)!")
+
+        # ═══ PHASE 1.5: KB Solution Replay ═══
+        # If KB has a known solution for the current level, try it before LLM
+        if kb and best_levels < fd.win_levels:
+            sol = kb.get_level_solution(best_levels + 1)
+            if sol and sol.confidence >= 0.5:
+                if self.verbose:
+                    print(f"  KB: replaying solution for L{best_levels+1} (confidence {sol.confidence:.0%})")
+                prev_grid_sol = get_frame(fd).copy()
+                for s in sol.sequence:
+                    if steps_used >= budget:
+                        break
+                    r, c = s.get("r", 0), s.get("c", 0)
+                    repeats = s.get("repeats", 1)
+                    for _ in range(repeats):
+                        if steps_used >= budget:
+                            break
+                        try:
+                            fd = env.step(INT_TO_GAME_ACTION[6], data={'x': c, 'y': r})
+                            steps_used += 1
+                            self.action_history.append(6)
+                        except Exception:
+                            break
+                if fd.levels_completed > best_levels:
+                    best_levels = fd.levels_completed
+                    sol.attempts += 1
+                    sol.successes += 1
+                    sol.last_verified_session = kb.session_count
+                    if self.verbose:
+                        print(f"  ★ KB solution worked! L{best_levels}")
+                else:
+                    sol.attempts += 1
+                    sol.confidence = max(0.1, sol.confidence - 0.1)
+                    if self.verbose:
+                        print(f"  KB solution failed (confidence → {sol.confidence:.0%})")
+                grid = get_frame(fd)
 
         # ═══ PHASE 2: Perception-driven placement (if applicable) ═══
         # For placement puzzles, try pure perception before LLM
@@ -1201,6 +1307,14 @@ class SageAgent:
                     best_levels = fd.levels_completed
                     if self.verbose:
                         print(f"  ★ Placement solved level {best_levels}!")
+                    # KB: Record placement solution
+                    if kb:
+                        seq = [{"r": d['y'], "c": d['x'], "repeats": 1}
+                               for a, d in placement_actions if a == 6 and d]
+                        kb.record_level_solution(best_levels, seq,
+                                                 preconditions="placement_puzzle",
+                                                 confidence=0.9,
+                                                 notes="perception-driven placement")
                 grid = new_grid
 
         # ═══ PHASE 3: LLM-guided play ═══
@@ -1271,6 +1385,27 @@ class SageAgent:
                         "actions": list(self.action_history[-10:]),
                     }
                 )
+
+                # VIZ: Save level-up frame with cursor annotation
+                if HAS_VIZ:
+                    save_annotated_frame(
+                        grid, os.path.join(viz_dir, f"level_{best_levels:02d}_solved.png"),
+                        cursor=cursor_pos,
+                        label=f"L{best_levels} solved | step {step}")
+                    self._viz_frames.append(grid.copy())
+                    self._viz_labels.append(f"L{best_levels} solved")
+
+                # KB: Record level solution from recent click data
+                if kb:
+                    recent_clicks = [(a, d) for a, d in self.click_data_history[-20:]
+                                     if a == 6 and d]
+                    if recent_clicks:
+                        seq = [{"r": d['y'], "c": d['x'], "repeats": 1}
+                               for a, d in recent_clicks]
+                        kb.record_level_solution(best_levels, seq,
+                                                 confidence=0.7,
+                                                 notes=f"auto-captured session {kb.session_count}")
+                    kb.best_level = max(kb.best_level, best_levels)
 
                 # Store level-up knowledge
                 recent_actions = self.action_history[-15:]
@@ -1416,9 +1551,46 @@ class SageAgent:
                 if self.banned_actions:
                     ban_str = ", ".join(list(self.banned_actions.keys())[:3])
                     action_desc = (action_desc or "") + f" DO NOT repeat: {ban_str}"
+                    # If submit is banned, remove it from available actions in prompt
+                    if "5" in self.banned_actions:
+                        available_for_prompt = [a for a in available if a != 5]
+                    else:
+                        available_for_prompt = available
+                else:
+                    available_for_prompt = available
+
+                # Build curated KB context for prompt (not full dump)
+                kb_ctx = None
+                if kb:
+                    kb_parts = []
+                    cur_lvl = fd.levels_completed
+                    sol = kb.get_level_solution(cur_lvl + 1)
+                    if sol and sol.confidence >= 0.5:
+                        kb_parts.append(f"L{cur_lvl+1} solution known ({sol.confidence:.0%})")
+                    if kb.failed_approaches:
+                        fails = [fa.approach for fa in kb.failed_approaches[:2]]
+                        kb_parts.append(f"Failed: {'; '.join(fails)}")
+                    if kb.mechanics:
+                        kb_parts.append(f"Rules: {'; '.join(kb.mechanics[:2])}")
+                    # High-impact objects the model should focus on
+                    high_impact = sorted(
+                        [o for o in kb.objects.values()
+                         if o.avg_cells_changed >= 20 and o.effect_count > 0],
+                        key=lambda o: -o.avg_cells_changed)[:3]
+                    if high_impact:
+                        obj_strs = [f"{o.color}({o.position['c']},{o.position['r']}) {o.avg_cells_changed:.0f}px"
+                                    for o in high_impact]
+                        kb_parts.append(f"High-impact: {', '.join(obj_strs)}")
+                    # Dead objects to avoid
+                    dead = [o for o in kb.objects.values()
+                            if o.click_count >= 3 and o.effect_count == 0]
+                    if dead:
+                        kb_parts.append(f"Inert ({len(dead)} objects): don't click")
+                    if kb_parts:
+                        kb_ctx = "Prior: " + " | ".join(kb_parts)
 
                 prompt, category = build_strategy_prompt(
-                    grid, available, all_memories,
+                    grid, available_for_prompt, all_memories,
                     {"current": fd.levels_completed, "total": fd.win_levels},
                     cartridge=cartridge,
                     initial_grid=initial_grid,
@@ -1430,6 +1602,7 @@ class SageAgent:
                     prev_grid=prev_grid,
                     last_action_desc=action_desc,
                     action_history=list(action_history_descs),
+                    kb_context=kb_ctx,
                 )
                 llm_response = sage_reason(prompt)
 
@@ -1471,7 +1644,8 @@ class SageAgent:
                     actions_to_take = heuristic_action(
                         grid, available, category, step,
                         effective_actions=self.effective_actions,
-                        color_effectiveness=self.color_effectiveness)
+                        color_effectiveness=self.color_effectiveness,
+                        banned_actions=self.banned_actions)
                 llm_cooldown = max(0, llm_cooldown - 1)
 
             if not actions_to_take:
@@ -1501,11 +1675,25 @@ class SageAgent:
 
                 step += 1
                 self.action_history.append(action_int)
+                self.click_data_history.append((action_int, data))
 
             # OBSERVE what changed
             new_grid = get_frame(fd)
             diff = grid_diff(prev_grid, new_grid)
             prev_result = diff if diff != "No change" else None
+            n_changed = int(np.sum(prev_grid != new_grid))
+
+            # KB: Record click effects
+            if kb:
+                for a_done, d_done in actions_to_take:
+                    if a_done == 6 and d_done:
+                        click_x, click_y = d_done['x'], d_done['y']
+                        click_color = color_name(int(prev_grid[click_y, click_x])) if 0 <= click_y < prev_grid.shape[0] and 0 <= click_x < prev_grid.shape[1] else "unknown"
+                        level_up = fd.levels_completed > best_levels
+                        kb.record_click_effect(
+                            r=click_y, c=click_x, color=click_color,
+                            cells_changed=n_changed, level_up=level_up,
+                            level=fd.levels_completed)
 
             # Update cursor position and build action description
             old_cursor = cursor_pos
@@ -1590,19 +1778,58 @@ class SageAgent:
                 f"Category: {category.get('category')}."
             )
 
-        # LLM REFLECTION: Ask the model what it learned about this game
+        # LLM REFLECTION: Raising-style metacognitive reflection
+        # Not just "what pattern" but "what did I try, what worked, what would I change"
         if self.use_llm and self.check_llm() and step > 10:
             reflection_prompt = (
-                f"Game {prefix}: {best_levels}/{fd.win_levels} levels. "
+                f"Game {prefix}: {best_levels}/{fd.win_levels} levels in {step} steps. "
                 f"Category: {category.get('category')}. "
-                f"{explore_ctx[:150]} "
-                f"What pattern did you notice? One sentence."
+                f"{explore_ctx[:100]} "
+                f"What did you try? What worked or didn't? What would you do differently? One sentence each."
             )
-            reflection = sage_reason(reflection_prompt, max_tokens=60)
+            reflection = sage_reason(reflection_prompt, max_tokens=-1)
             if reflection:
                 membot_store(f"ARC-AGI-3 {prefix} reflection: {reflection[:200]}")
                 if self.verbose:
-                    print(f"  Reflection: {reflection[:80]}")
+                    print(f"  Reflection: {reflection[:100]}")
+
+                # KB: Extract mechanics or questions from reflection
+                if kb:
+                    if best_levels > 0:
+                        kb.add_mechanic(f"Scored {best_levels}L: {reflection[:100]}")
+                    elif step > 100:
+                        kb.add_question(f"0L after {step} steps: {reflection[:80]}")
+
+        # Save knowledge base (persistent across runs)
+        if kb:
+            kb.save()
+            if self.verbose:
+                s = kb.stats
+                print(f"  KB saved: {s['n_objects']} objects, {s['n_effects']} effects, "
+                      f"{s['n_solutions']} solutions")
+
+        # VIZ: Save final state and game summary
+        if HAS_VIZ:
+            final_grid = get_frame(fd)
+            # Annotate final frame with KB highlights
+            kb_highlights = []
+            if kb:
+                for o in kb.objects.values():
+                    if o.avg_cells_changed >= 20 and o.effect_count > 0:
+                        kb_highlights.append((o.position["c"], o.position["r"], "green"))
+            save_annotated_frame(
+                final_grid, os.path.join(viz_dir, "99_final.png"),
+                cursor=cursor_pos,
+                highlights=kb_highlights,
+                label=f"Final: {best_levels}/{fd.win_levels}L | {step} steps | {fd.state.name}")
+            self._viz_frames.append(final_grid.copy())
+            self._viz_labels.append(f"final {best_levels}L")
+            # Summary strip
+            save_game_summary(self._viz_frames,
+                              os.path.join(viz_dir, "summary.png"),
+                              labels=self._viz_labels, scale=4)
+            if self.verbose:
+                print(f"  Viz: saved to {viz_dir}/")
 
         # Save visual memory cartridge
         cartridge.write()

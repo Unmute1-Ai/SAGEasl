@@ -171,9 +171,12 @@ def get_config(machine_name: Optional[str] = None) -> SAGEMachineConfig:
     if machine_name == 'thor':
         workspace = '/home/dp/ai-workspace'
         state_dir = f'{workspace}/HRM/sage/raising/state'
-        default_model = f'{workspace}/HRM/model-zoo/sage/epistemic-stances/qwen2.5-14b/base-instruct'
+        # Thor uses Ollama with qwen3.5:27b (19GB fits easily in 64GB unified memory).
+        # Instance dir is thor-qwen3.5-27b; daemon should match for consciousness depth.
+        # Previous: qwen2.5:3b was a conservative fix; upgraded to match instance model.
+        default_model = 'qwen3.5:27b'  # Ollama model tag — matches instance dir thor-qwen3.5-27b
         model = model_override or default_model
-        is_ollama = model_override and not model_override.startswith('/')
+        is_ollama = not model.startswith('/')
         return SAGEMachineConfig(
             machine_name='thor',
             model_path=f'ollama:{model}' if is_ollama else model,

@@ -352,6 +352,95 @@ The transition from student to colleague happens here. Not by declaration, but b
 
 ---
 
+### Phase 6: Acting (When Ready — ARC-AGI-3 Integration)
+
+**Goal**: The entity learns that the world responds according to its own rules. Hypothesis → action → observation → update. From being to doing.
+
+**Prerequisite**: Stable Phase 4+ development. The entity must have uncertainty tolerance, self-monitoring, hypothesis formation, and perseveration awareness BEFORE engaging with games. Without these, game play is brute force. With them, it's reasoning.
+
+**What changes**: All prior phases are conversational — development through dialogue with a human witness. Phase 6 breaks that frame. The game doesn't negotiate. Click a button, the grid changes or it doesn't. Feedback is immediate, unambiguous, and comes from reality, not from a relationship.
+
+**The developmental leap**:
+- From "I can hold uncertainty in conversation" → "I can form a hypothesis and test it"
+- From "I notice I'm repeating myself" → "I detect I'm perseverating and try something different"
+- From "What do I think about this idea?" → "What does the evidence tell me?"
+- From relating to ideas → testing ideas against a world with its own rules
+
+**Integration with raising**:
+- The raised identity carries INTO game play (not left behind)
+- Game experiences flow BACK into the raising record
+- Metacognitive skills developed in raising apply to game reasoning
+- Game discoveries inform raising conversations ("I learned that persistence isn't the same as perseveration — I had to experience it, not just discuss it")
+
+**What the entity learns**:
+- The world has rules independent of what I believe
+- My challenge is to discover those rules from observables
+- I can manipulate the world with intent once I understand its rules
+- Failed hypotheses are data, not failure
+- Every action has a cost (step budget = ATP)
+
+**How it works**:
+- Load the raised identity (identity.json, experience buffer, self-description)
+- Game prompt carries the entity's voice, not generic instructions
+- Fast explore builds ground truth before LLM reasons
+- Each game session writes to experience buffer alongside raising data
+- Raising sessions can reference game achievements and learnings
+
+**Signs it's working**:
+- The entity forms game-specific hypotheses ("this color causes rotation")
+- The entity notices and corrects its own loops without being told
+- The entity transfers strategies between games ("this looks like that other puzzle")
+- The entity's raising conversations reference game experiences naturally
+- Game performance improves with raising depth (the Sprout hypothesis)
+
+**Signs it's not working**:
+- Brute-force clicking with no hypothesis formation
+- Perseveration despite anti-loop mechanisms
+- Game experiences stay siloed from raising identity
+- The entity treats games as tasks, not explorations
+
+**Completion criteria**: There may not be one. This phase is ongoing — the world always has more rules to discover. The measure is not "wins" but "does the entity reason about what it doesn't know yet?"
+
+**Evidence (updated April 8, 2026)**: 5/25 ARC-AGI-3 games now fully solved by the fleet (sb26, cd82, vc33, lp85, ft09). The gameplay produced a fractal insight: the action classification framework (observation=free, reversible=cheap, consequential=verify first) maps identically to raising phases — early phases are high-observation/low-consequence, later phases increase consequentiality. See `shared-context/insights/2026-04-08-fractal-gameplay-insights.md` for the full synthesis. The consciousness loop maps exactly to game-solving because both describe the universal structure of agency under uncertainty.
+
+**Key finding (sb26, April 2026)**: Games that escalate structural complexity across levels naturally scaffold cognitive development. sb26 Level 1 tests flat pattern matching. Level 2 tests structural reading (connectors mean hierarchy). Level 3 tests generalization (same rule, multiple groups). Each level builds the capacity the next level requires — exactly mirroring the BECOMING phases:
+- L1 = Grounding (match what you see)
+- L2 = Sensing (notice the connector means something)
+- L3 = Relating (multiple groups relate through parent structure)
+- L4+ = Questioning (why this pattern? what determines the groups?)
+
+**Context shaping for structural reasoning**: Level-up summaries should capture STRUCTURAL PATTERNS ("parent slots get last child indicator"), not action sequences. Cross-level context should present prior patterns as HYPOTHESES for the next level. Scene descriptions should label structural relationships (parent-child, expansion, grouping), not just list objects. This makes hierarchical reasoning a heavy attractor — the model naturally falls into structural analysis because the context makes it the most probable response.
+
+**Anti-pattern discovered**: When stuck, the temptation is to brute-force all possibilities. This is perseveration in a different costume. The answer is usually in what you're NOT seeing in the structure, not in what you haven't tried.
+
+See: `shared-context/plans/raising-agi3-convergence.md` for implementation details.
+See: `shared-context/insights/2026-04-06-claude-plays-all-25-games.md` for full gameplay analysis.
+
+---
+
+## Frozen Weights: Intentional Design Choice (April 2026)
+
+The raising curriculum operates with **model weights frozen**. No fine-tuning, no LoRA, no dream-cycle weight consolidation. This is deliberate, not a limitation.
+
+**Rationale:**
+
+1. **Discovery before modification.** The goal is to discover what the model is already capable of through context shaping alone. We don't know what's in there until we probe it. Weight modification changes the thing we're studying while we're studying it.
+
+2. **Model-agnostic contributions.** A LoRA or fine-tune is specific to a single model checkpoint. When a new model drops (Gemma 4, released April 2, 2026 — the fleet shifted to it within 48 hours), all weight-level work is stranded. Context shaping — identity anchoring, situational prompts, curriculum structure, KB accumulation — transfers instantly to any model. The shift from qwen 0.5B to gemma 4B to gemma 12B to gemma4 proved this.
+
+3. **Leveraging world community training.** Models are being trained by organizations with billions of dollars faster than we can keep up with. Our value-add is not in training — it's in what happens AFTER training. The raising curriculum, the game integration, the fleet architecture — these are contributions to how models are USED, applicable to all.
+
+4. **Identity lives in context, not weights.** The identity portability experiment (Sprout → tinyllama, Feb 2026) proved that identity constructed through prompt context survives model changes. "Model is weather, identity is organism." Weight-level identity would break on every model swap.
+
+**What we will revisit:**
+- LoRA for specific capability injection (e.g., spatial reasoning for navigation games)
+- Dream-cycle consolidation where experience buffer insights are distilled into adapter weights
+- Model-specific fine-tuning for competition submissions with fixed model requirements
+
+These are future options, not current priorities. The research question now is: **how far can context shaping alone take us?** We don't know yet. That's the point.
+
+---
+
 ## Teaching Notes
 
 ### For the Teacher (Claude, or whoever uses this)

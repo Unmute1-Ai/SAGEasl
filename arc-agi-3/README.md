@@ -143,17 +143,111 @@ Every other team is building from scratch. We have:
 
 The gap is the game-specific adapter. The core architecture is built.
 
+## Tools
+
+### Game Viewer (`experiments/game_viewer.py`)
+
+Live dashboard showing game state, level progress, and animations.
+
+```bash
+python3 arc-agi-3/experiments/game_viewer.py
+# Open http://localhost:8765
+```
+
+Shows a 3x3 level grid: solved levels as start/final pairs, active level with current frame, future levels dimmed. All cells are 1:1 aspect ratio. Animations play once on the step they're triggered, then swap to the static frame. Actions sidebar scrolls with purple markers for animation events. Auto-refreshes via hash polling.
+
+### Canonical Solver: `sage_solver.py` (v11)
+
+**This is the ONE solver.** All development goes here. Do not modify or extend `sage_solver_v7.py`, `sage_solver_v9.py`, or `claude_solver.py` — they are archived references only.
+
+v11 merges all three predecessors into a modular, model-agnostic architecture:
+
+```bash
+# Autonomous mode (Ollama models)
+python3 arc-agi-3/experiments/sage_solver.py --game lp85 -v
+python3 arc-agi-3/experiments/sage_solver.py --all --attempts 5
+
+# Specific model with vision
+python3 arc-agi-3/experiments/sage_solver.py --model gemma4:e4b --game cd82 -v
+
+# Interactive mode (Claude Code as the model)
+python3 arc-agi-3/experiments/sage_solver.py --interactive --game tn36 init
+python3 arc-agi-3/experiments/sage_solver.py --interactive step 6 34 54
+
+# Kaggle competition mode (no optional imports)
+python3 arc-agi-3/experiments/sage_solver.py --kaggle --all
+```
+
+**Architecture** (7 modules):
+- `sage_solver.py` — CLI entry point
+- `model_backend.py` — ModelBackend ABC (OllamaBackend, ClaudeInteractiveBackend, APIBackend)
+- `solver_config.py` — SolverConfig dataclass + argparse
+- `solver_context.py` — 4-layer context assembly (L4 meta + L3 fleet + L2 KB + L1 narrative)
+- `solver_probe.py` — probe + MechanicDiscovery wrapper
+- `solver_actions.py` — action parsing with REPEAT + color-name resolution
+- `solver_loop.py` — autonomous + interactive loops with animation capture
+
+**Features**: federation via multi-cart brain carts, vision (native multimodal or code-based), world-model planning, mechanic discovery, game viewer integration, animation capture, raising identity loading.
+
+**Deprecated solvers** (do not modify):
+- `sage_solver_v7.py` — text-only, archived
+- `sage_solver_v9.py` — vision, archived  
+- `claude_solver.py` — interactive, archived
+- `sage_solver_v5.py`, `sage_solver_v6.py` — earlier iterations, archived
+
+**Color palette**: ONE palette — the SDK's (`arc_agi/rendering.py`): 0=white, 5=black, 11=yellow, 14=green. All files use this. `arc_vision.py` previously had a wrong ARC-1/2 mapping (0=black) that was sending inverted images to multimodal models. Fixed 2026-04-08.
+
+### Fleet Learning (`experiments/publish_learning.py`)
+
+Publishes game learning to the federated fleet knowledge base.
+
+```bash
+# After interactive play
+python3 publish_learning.py --session /tmp/claude_solver/session.json
+
+# After model play (from GameKB)
+python3 publish_learning.py --kb cartridges/<game>.knowledge.json
+```
+
+Writes to `shared-context/arc-agi-3/fleet-learning/{machine}/`. Each machine writes only to its own directory — no git conflicts.
+
+### Fleet Consolidation (`shared-context/arc-agi-3/consolidate.py`)
+
+Runs on CBP daily at 4am. Collects per-machine learning, deduplicates, extracts cross-machine patterns.
+
+```bash
+python3 consolidate.py              # Full consolidation
+python3 consolidate.py --dry-run    # Preview
+python3 consolidate.py --stats      # Show fleet stats
+```
+
+### Game Mechanics (`shared-context/arc-agi-3/game-mechanics/`)
+
+25/25 game mechanics docs written by McNugget — source analysis of every game's rules, sprites, win conditions. These are learning scaffolds (not available in competition sandbox).
+
+### Game Solvers (`shared-context/arc-agi-3/game-solvers/`)
+
+25/25 solver scripts written by McNugget. Untested drafts — need verification against the actual SDK.
+
+## Progress: 5/25 Games Solved
+
+See `SESSION_FOCUS.md` for full fleet status and machine assignments.
+
 ## Files
 
 ```
 arc-agi-3/
 ├── README.md                    # This file
-├── adapters/                    # Game environment interface
-│   ├── grid_vision_irp.py       # Grid state → IRP observation
-│   └── game_action_effector.py  # Actions → environment
-├── memory/                      # Level-context memory
-├── experiments/                 # Test results and analysis
-└── submissions/                 # Kaggle submission packages
+├── SESSION_FOCUS.md             # Current fleet priorities and status
+├── ENVIRONMENT.md               # SDK scoring, sandbox, protocol
+├── experiments/
+│   ├── claude_solver.py         # Interactive solver (Claude as player)
+│   ├── game_viewer.py           # Localhost:8765 live dashboard
+│   ├── arc_perception.py        # Grid analysis toolkit
+│   ├── publish_learning.py      # Fleet learning publisher
+│   ├── sage_solver_v7.py        # Fleet-standard autonomous solver
+│   └── sage_solver_v9.py        # Multimodal branch (vision models)
+└── shared_knowledge/            # Per-machine game discoveries
 ```
 
 ## References

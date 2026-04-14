@@ -23,10 +23,13 @@ Usage:
 """
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sage.irp.adapters.model_capabilities import ModelCapabilities, load_capabilities
+
+_log = logging.getLogger('sage.adapter.cleaning')
 
 
 class ModelAdapter:
@@ -54,9 +57,11 @@ class ModelAdapter:
         2. Bilateral generation truncation — model generated other speakers
         """
         if not response:
+            _log.debug("clean_response: input was empty/falsy")
             return response
 
         text = response.strip()
+        raw_text = text
         caps = self._capabilities
 
         # 1. Echo stripping — model echoed a prompt prefix
@@ -78,10 +83,49 @@ class ModelAdapter:
 
         # 3. Think-tag stripping — Qwen 3.5 emits <think>...</think> blocks
         if caps.strip_think_tags:
-            # First strip complete think blocks
-            text = re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
-            # Then strip any remaining incomplete think blocks (truncated generations)
-            text = re.sub(r'<think>[\s\S]*$', '', text).strip()
+            # Extract content outside think tags
+            text_without_think = re.sub(r'<think>[\s\S]*?</think>', '', text).strip()
+            text_without_think = re.sub(r'<think>[\s\S]*$', '', text_without_think).strip()
+
+            # If there's content outside think tags, use it
+            if text_without_think:
+                text = text_without_think
+            else:
+                # If ALL content is inside think tags, extract FROM them instead
+                # This handles qwen3.5:27b which puts entire response in <think>
+                think_match = re.search(r'<think>([\s\S]*?)(?:</think>|$)', text)
+                if think_match:
+                    text = think_match.group(1).strip()
+                else:
+                    # Fallback: use original text
+                    text = text_without_think
+
+        # 4. Chain-of-thought bleeding — strip structured reasoning artifacts
+        # When content is extracted from <think> blocks, it often contains the
+        # model's internal analysis format. Strip these artifacts but preserve
+        # the actual substantive content underneath.
+        if text.startswith('Thinking Process:') or text.startswith('Thinking Process\n'):
+            text = re.sub(r'^Thinking Process:?\s*', '', text).strip()
+        if '\n\nThinking Process:' in text or '\nThinking Process:' in text:
+            text = re.sub(r'\n+Thinking Process:[\s\S]*$', '', text).strip()
+
+        # Strip numbered analysis format (e.g. "1. **Analyze the Request:**...")
+        # that leaks from think blocks. Look for the actual response after the analysis.
+        if re.match(r'^1\.\s+\*{0,2}Analyze', text):
+            # Find actual response after analysis — look for "Response:" or similar
+            response_match = re.search(
+                r'(?:^|\n)\s*(?:\d+\.\s+)?\*{0,2}(?:Response|Answer|Reply|Output|Final)[:\s*]*\*{0,2}\s*(.*)',
+                text, re.DOTALL | re.IGNORECASE)
+            if response_match:
+                extracted = response_match.group(1).strip()
+                if extracted:
+                    text = extracted
+
+        if raw_text and not text:
+            _log.warning(
+                "clean_response: non-empty raw → empty output. "
+                "raw_len=%d, raw_preview=%.300s", len(raw_text), raw_text
+            )
 
         return text
 
@@ -155,6 +199,9 @@ class ChatAPIAdapter(ModelAdapter):
     def format_payload(self, prompt, options, ollama_host):
         messages = self._prose_to_messages(prompt)
         opts = dict(options)
+        # Apply model-specific stop sequences from capabilities
+        if self._capabilities.stop_sequences:
+            opts['stop'] = self._capabilities.stop_sequences
         payload = {
             'messages': messages,
             'stream': False,
@@ -164,10 +211,19 @@ class ChatAPIAdapter(ModelAdapter):
         return '/api/chat', payload
 
     def _prose_to_messages(self, prose_prompt: str) -> List[Dict[str, str]]:
-        """Parse SAGE prose prompt into Ollama chat messages."""
+        """Parse SAGE prose prompt into Ollama chat messages.
+
+        Handles two prompt formats:
+        1. Separator style:  "system text\\n---\\nName: content\\n\\nName: content"
+        2. Tag style:        "[System]\\ntext\\n\\n[Claude]: content\\n[Thor]: content"
+        """
         messages = []
 
-        # Split system from conversation
+        # Detect tag-style format: [System] header followed by [Name]: turns
+        if prose_prompt.lstrip().startswith('[System]'):
+            return self._parse_tag_style(prose_prompt)
+
+        # Separator style: split system from conversation on ---
         if '\n---\n' in prose_prompt:
             system_part, conv_part = prose_prompt.split('\n---\n', 1)
             system_text = system_part.strip()
@@ -177,7 +233,6 @@ class ChatAPIAdapter(ModelAdapter):
             conv_part = prose_prompt
 
         # Parse turns: "Name: content" blocks separated by double newlines
-        # The last line is "SAGEName:" (completion prompt) — skip it
         lines = conv_part.strip().split('\n\n')
 
         # Remove trailing empty "Name:" completion prompt
@@ -188,23 +243,56 @@ class ChatAPIAdapter(ModelAdapter):
             line = line.strip()
             if not line:
                 continue
-            # Match "Name: content"
             m = re.match(r'^(\w[\w\s]*):\s*(.*)', line, re.DOTALL)
             if m:
                 speaker = m.group(1).strip()
                 content = m.group(2).strip()
-                # Heuristic: SAGE names tend to be machine names (CBP, Thor, etc.)
-                # User names are human names. We can't perfectly distinguish, so
-                # we use the last word pattern: all-caps or short = machine = assistant
-                # This is approximate — the consciousness loop knows the roles.
                 role = self._guess_role(speaker)
                 messages.append({'role': role, 'content': content})
             else:
-                # Unstructured line — append to last message or as user
                 if messages:
                     messages[-1]['content'] += '\n' + line
                 else:
                     messages.append({'role': 'user', 'content': line})
+
+        return messages
+
+    def _parse_tag_style(self, prose_prompt: str) -> List[Dict[str, str]]:
+        """Parse [System]/[Name]: style prompts from the raising session runner."""
+        messages = []
+
+        # Split into [System] block and conversation turns
+        # Format: [System]\n...system text...\n\n[Claude]: ...\n[Thor]: ...\n\n...
+        text = prose_prompt.strip()
+
+        # Extract system block: everything from [System]\n to the first [Name]: turn
+        system_match = re.match(
+            r'\[System\]\s*\n(.*?)(?=\n\[(?:Claude|System|User|Human|\w+)\]:)',
+            text, re.DOTALL)
+        if system_match:
+            system_text = system_match.group(1).strip()
+            if system_text:
+                messages.append({'role': 'system', 'content': system_text})
+            text = text[system_match.end():]
+
+        # Parse [Name]: content turns
+        # Split on [Name]: pattern, capturing the name
+        turn_pattern = re.compile(r'\[(\w[\w\s]*)\]:\s*')
+        parts = turn_pattern.split(text)
+
+        # parts alternates: [pre-text, name1, content1, name2, content2, ...]
+        i = 1  # skip any pre-text before first [Name]:
+        while i + 1 < len(parts):
+            speaker = parts[i].strip()
+            content = parts[i + 1].strip()
+            i += 2
+
+            # Skip trailing empty completion prompt (e.g. "[Thor]:" with no content)
+            if not content:
+                continue
+
+            role = self._guess_role(speaker)
+            messages.append({'role': role, 'content': content})
 
         return messages
 

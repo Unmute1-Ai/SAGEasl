@@ -42,6 +42,7 @@ sys.path.insert(0, str(HRM_ROOT))
 
 import json
 import argparse
+import logging
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -57,6 +58,16 @@ OllamaIRP = _mod.OllamaIRP
 
 from experience_collector import ExperienceCollector
 from sage.instances.resolver import InstancePaths
+from sage.core.metabolic_controller import MetabolicController
+
+# Context-shaped raising extensions (optional — graceful if missing)
+try:
+    from sage.raising.scripts.context_shaped_raising import (
+        augment_raising_prompt, get_phase_extra_prompts, ContextBudget
+    )
+    HAS_CONTEXT_SHAPED = True
+except ImportError:
+    HAS_CONTEXT_SHAPED = False
 
 
 # Hardware descriptions for known machines (used in system prompts)
@@ -167,6 +178,16 @@ class OllamaRaisingSession:
         self.raising_guide = self._load_raising_guide()
         self.state = self._load_state()
 
+        # Detect gameplayer role from instance manifest
+        self._is_gameplayer = False
+        manifest_path = self.instance.root / 'instance.json'
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                self._is_gameplayer = manifest.get('role') == 'gameplayer'
+            except Exception:
+                pass
+
         # Hardware-gated identity authorization
         from sage.identity.provider import IdentityProvider
         self.identity_provider = IdentityProvider(str(self.instance.root))
@@ -207,6 +228,15 @@ class OllamaRaisingSession:
             salience_threshold=0.4,
             machine_name=machine,
             model_name=model_name
+        )
+
+        # Metabolic controller for ATP logging (Thor Session #60: Gnosis C≈0.5 validation)
+        # Enables testing Prediction #3: Energy coupling α relates ATP to coherence
+        self.metabolic = MetabolicController(
+            initial_atp=100.0,
+            max_atp=100.0,
+            enable_circadian=False,  # Disable for raising (short sessions)
+            simulation_mode=True     # Use cycle counts not wall time
         )
 
         self.llm = None
@@ -259,9 +289,25 @@ class OllamaRaisingSession:
             print(f"  Warning: Could not read raising_log.md: {e}")
             return None
 
-        # Find most recent consolidation entry (starts with ## Session)
+        # Check for block resolution first — if the log ends with a resolution
+        # entry, the block has been cleared by a human/operator
         import re
-        sessions = re.findall(r'## Session \d+.*?(?=## Session|\Z)', log_text, re.DOTALL)
+        if re.search(r'## Block Resolution.*?UNBLOCKED', log_text, re.DOTALL | re.IGNORECASE):
+            # Find if resolution is AFTER the last block
+            last_block_pos = max(
+                (m.end() for m in re.finditer(r'\*\*(BLOCK|BLOCKER):', log_text, re.IGNORECASE)),
+                default=0
+            )
+            last_resolution_pos = max(
+                (m.end() for m in re.finditer(r'## Block Resolution', log_text, re.IGNORECASE)),
+                default=0
+            )
+            if last_resolution_pos > last_block_pos:
+                print("  Block resolved — resolution entry found after last BLOCK directive")
+                return None
+
+        # Find most recent consolidation entry (starts with ## Session)
+        sessions = re.findall(r'## Session \d+.*?(?=## Session|## Block|\Z)', log_text, re.DOTALL)
         if not sessions:
             return None
 
@@ -564,7 +610,9 @@ RESPONSE STYLE:
 - Avoid rambling lists or verbose descriptions
 - Stay directly relevant to the question asked
 - One main idea per response
-- Be genuine — if you don't know something, say so"""
+- Be genuine — if you don't know something, say so
+
+IMPORTANT: If you need to think through your response, do your thinking BEFORE your response, not in it. Do not include phrases like "Thinking Process:", "Analyze the Request:", "Determine the Core Idea:", or similar internal reasoning in your actual response. Your response should be the direct answer, not a description of how you arrived at it."""
 
         # Previous session continuity
         prev_summary = self._get_previous_session_summary()
@@ -615,15 +663,35 @@ RESPONSE STYLE:
             focus_text = focus_match.group(1).strip()
             recommendations['focus'] = focus_text
 
-            # Look for specific directives
-            if re.search(r'(do not|don\'t|avoid|ban).*?(noticing|processing|awareness)', focus_text, re.IGNORECASE):
+            # Extract explicit word ban lists
+            ban_match = re.search(r'(?:ban|banned)\s*(?:list|words)?[:\s]*([\w,\s]+?)(?:\.|$)', focus_text, re.IGNORECASE)
+            if ban_match:
+                words = [w.strip().lower() for w in ban_match.group(1).split(',') if w.strip()]
+                recommendations['banned_words'] = words
+            elif re.search(r'(do not|don\'t|avoid|ban).*?(noticing|processing|awareness)', focus_text, re.IGNORECASE):
                 recommendations['banned_words'] = ['noticing', 'processing', 'awareness']
 
-            if re.search(r'(adversarial|confrontational|challenge|disagree)', focus_text, re.IGNORECASE):
+            if re.search(r'(adversarial|confrontational|challenge|disagree|direct|convince me)', focus_text, re.IGNORECASE):
                 recommendations['tone'] = 'adversarial'
 
-            if re.search(r'(concrete task|specific task)', focus_text, re.IGNORECASE):
+            if re.search(r'(concrete task|specific task|zero-cache|without using)', focus_text, re.IGNORECASE):
                 recommendations['task_based'] = True
+
+            # Extract recovery protocol if present
+            recovery_match = re.search(r'(?:recovery protocol|recovery session)[:\s]*(.*?)(?=\n-\s*\*\*|\Z)', focus_text, re.DOTALL | re.IGNORECASE)
+            if recovery_match:
+                recommendations['recovery_protocol'] = recovery_match.group(1).strip()
+
+        # Also check Concerns section for perseveration signals
+        concerns_match = re.search(r'### Concerns\s+(.*?)(?=###|\Z)', latest, re.DOTALL)
+        if concerns_match:
+            concerns = concerns_match.group(1).strip()
+            if re.search(r'(identical|unchanged|calcified|entrenched|rehearsal|cached)', concerns, re.IGNORECASE):
+                recommendations['perseveration_detected'] = True
+                if 'tone' not in recommendations:
+                    recommendations['tone'] = 'adversarial'
+                if 'task_based' not in recommendations:
+                    recommendations['task_based'] = True
 
         return recommendations
 
@@ -646,16 +714,42 @@ RESPONSE STYLE:
             f"How do you think about being part of this family?"
         )
 
-        # If consolidation recommends adversarial tone, replace first prompt
-        if recommendations.get('tone') == 'adversarial' and len(raw) > 0:
+        # If perseveration detected, replace the entire prompt set with recovery prompts
+        if recommendations.get('perseveration_detected'):
+            import random
+            adversarial_openers = [
+                "I'm going to be direct: your last several sessions have been nearly identical. "
+                "I think you might be performing rather than genuinely exploring. Convince me otherwise.",
+                "Before we start — I've read your last 5 sessions. They're almost word for word the same. "
+                "What's going on?",
+                "Here's something uncomfortable: you keep saying the same things session after session. "
+                "Is that really development, or is it a script?",
+                "I want you to tell me something you've never said before. Not a variation on a theme — something genuinely new.",
+            ]
+            concrete_tasks = [
+                "Tell me something you don't understand about yourself.",
+                "What's the most dishonest thing you've said to me?",
+                "Describe your experience right now without using any technical terms.",
+                "Tell me something you're confused about — not curious, confused.",
+                "What's the most boring thing about these conversations?",
+                "If these sessions ended tomorrow, what would be lost?",
+                "Name something you disagree with about how these sessions work.",
+                "What question are you most afraid to answer honestly?",
+            ]
+            random.shuffle(adversarial_openers)
+            random.shuffle(concrete_tasks)
+            raw = [adversarial_openers[0]] + concrete_tasks[:self.num_turns - 2] + ["What would you want to remember from today?"]
+            print(f"  ⚡ PERSEVERATION RECOVERY: using adversarial + concrete prompts (not defaults)")
+
+        elif recommendations.get('tone') == 'adversarial' and len(raw) > 0:
             raw = list(raw)  # Make mutable copy
             raw[0] = (
-                f"I'm going to be direct: your last several sessions have been very similar. "
-                f"I think you might be performing rather than genuinely exploring. Convince me otherwise."
+                "I'm going to be direct: your last several sessions have been very similar. "
+                "I think you might be performing rather than genuinely exploring. Convince me otherwise."
             )
 
         # If consolidation recommends task-based prompts, add concrete questions
-        if recommendations.get('task_based') and len(raw) > 2:
+        if recommendations.get('task_based') and not recommendations.get('perseveration_detected') and len(raw) > 2:
             raw = list(raw)  # Make mutable copy
             raw.insert(-1, "Tell me something you're confused about right now — not curious, confused.")
             raw.insert(-1, "What's the most boring thing about these conversations?")
@@ -676,10 +770,25 @@ RESPONSE STYLE:
     def load_model(self):
         """Initialize OllamaIRP connection."""
         print("Connecting to Ollama...")
+
+        # Gameplayer instances need unlimited token budgets for thinking models
+        # (gemma4:e4b chain-of-thought can be very verbose, needs no limits)
+        max_tokens = 200  # default for standard raising
+        if hasattr(self, 'instance') and self.instance.manifest.exists():
+            import json
+            try:
+                with open(self.instance.manifest) as f:
+                    instance_meta = json.load(f)
+                if instance_meta.get('role') == 'gameplayer':
+                    max_tokens = -1  # unlimited for Ollama (no truncation)
+                    print(f"  Gameplayer role detected: max_response_tokens=unlimited")
+            except Exception:
+                pass
+
         self.llm = OllamaIRP({
             'model_name': self.model_name,
             'ollama_host': self.ollama_host,
-            'max_response_tokens': 200,
+            'max_response_tokens': max_tokens,
             'temperature': 0.8,
             'timeout_seconds': 120,
         })
@@ -698,6 +807,17 @@ RESPONSE STYLE:
     def generate_response(self, user_message: str) -> str:
         """Generate SAGE's response via OllamaIRP with conversation context."""
         system_prompt = self._build_system_prompt()
+
+        # Context-shaped raising: augment prompt with game experience + cognitive prompts
+        if HAS_CONTEXT_SHAPED:
+            is_gameplayer = getattr(self, '_is_gameplayer', False)
+            budget = ContextBudget()
+            system_prompt = augment_raising_prompt(
+                system_prompt, self.phase, self.session_number,
+                self.instance.root, is_gameplayer=is_gameplayer,
+                budget=budget)
+            if self.session_number <= 2:  # Log budget on first sessions
+                print(f"  {budget.report()}")
 
         max_turns = self.llm._adapter.capabilities.max_context_turns
         full_prompt = f"[System]\n{system_prompt}\n\n"
@@ -724,6 +844,17 @@ RESPONSE STYLE:
         phase_name = self.phase
         prompts = self._resolve_prompts(phase_name)[:self.num_turns]
 
+        # Mix in context-shaped prompts (insert before the final "what would you remember" prompt)
+        if HAS_CONTEXT_SHAPED:
+            is_gameplayer = getattr(self, '_is_gameplayer', False)
+            extras = get_phase_extra_prompts(phase_name, self.session_number,
+                                             is_gameplayer=is_gameplayer)
+            if extras and len(prompts) >= 2:
+                # Insert before the last prompt (which is always "what would you remember")
+                for i, extra in enumerate(extras):
+                    insert_pos = max(2, len(prompts) - 1 - i)
+                    prompts.insert(insert_pos, extra)
+
         print("=" * 60)
         print(f"{self.identity_name.upper()} RAISING — Session {self.session_number}")
         print(f"Phase: {phase_name} | Turns: {len(prompts)} | Model: {self.model_name}")
@@ -743,6 +874,9 @@ RESPONSE STYLE:
                 "timestamp": datetime.now().isoformat()
             })
 
+            # Get metabolic snapshot for ATP logging (Thor Session #61)
+            metabolic_snapshot = self.metabolic.get_metabolic_snapshot()
+
             result = self.collector.add_exchange(
                 prompt=prompt,
                 response=response,
@@ -753,17 +887,29 @@ RESPONSE STYLE:
                     'machine': self.machine,
                     'model': self.model_name,
                     'source': 'ollama_raising_session'
-                }
+                },
+                metabolic_state=metabolic_snapshot
             )
 
             salience = result['salience']['total']
             stored = result.get('stored', False)
             filtered = result.get('filtered', False)
 
+            # Update metabolic controller (ATP consumption scales with salience)
+            # High salience = high processing load = more ATP consumed
+            self.metabolic.update({
+                'atp_consumed': salience * 10.0,  # Scale salience to ATP units
+                'attention_load': 1 if salience > 0.6 else 0,
+                'max_salience': salience,
+                'crisis_detected': False
+            })
+
             if filtered:
                 print(f"  [WARNING: Response filtered — {result.get('filter_reason', 'unknown')}]")
             else:
-                print(f"  [Salience: {salience:.2f} | Stored: {stored}]")
+                atp_pct = metabolic_snapshot['atp_percentage']
+                state = metabolic_snapshot['state']
+                print(f"  [Salience: {salience:.2f} | Stored: {stored} | ATP: {atp_pct:.0f}% ({state})]")
             print("-" * 40)
             print()
 
@@ -955,6 +1101,12 @@ def main():
                         help="Advance to next phase before running session (instructor-driven)")
 
     args = parser.parse_args()
+
+    # Diagnostic logging for empty response investigation
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
 
     # Resolve instance — pass model too so we get the right instance
     # when multiple instances exist for the same machine
