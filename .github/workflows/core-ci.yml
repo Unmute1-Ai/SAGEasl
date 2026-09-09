@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip build
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev]" cryptography
       - name: Build distributable package
         run: python -m build
       - name: Governance and effect-system core tests
