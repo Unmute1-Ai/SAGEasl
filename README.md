@@ -1,4 +1,18 @@
-# SAGE: Situation-Aware Governance Engine
+# SAGE ASL — Unmute1AI Research Fork
+
+**Edge cognition research based on [SAGE by dp-web4](https://github.com/dp-web4/SAGE).**
+
+[Portfolio](https://github.com/Unmute1-Ai/Unmute1ai#readme) · [Engineering](https://github.com/Unmute1-Ai/U1Ai#readme) · [Security evidence](https://github.com/Unmute1-Ai/glass-box#readme)
+
+This repository is an upstream research fork with Unmute1AI integration notes. Upstream authorship, licensing, and research context are preserved below.
+
+Start with [UNMUTE1AI_INTEGRATION.md](UNMUTE1AI_INTEGRATION.md) for the U1 boundary, [ASL/](ASL/) for the ASL directory, and [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for readiness criteria.
+
+**Status: research fork.** Upstream measurements and deployment descriptions below refer to their stated environments and dates; they are not new Unmute1AI benchmark results.
+
+---
+
+## Upstream SAGE: Situation-Aware Governance Engine
 
 A cognition kernel for edge devices — orchestrating attention, trust, and resources across a federation of machines to enable emergent intelligence.
 
