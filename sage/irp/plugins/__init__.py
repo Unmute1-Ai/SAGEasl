@@ -18,11 +18,10 @@ if _FULL:
     __all__ += ['VisionIRP', 'LanguageIRP', 'ControlIRP', 'MemoryIRP',
                 'TinyVAEIRP', 'create_tinyvae_irp']
 
-# Speech NIM adapter is lightweight and does not require torch, riva-client,
-# or model downloads. Keep it independently importable in minimal deployments.
+# Speech NIM adapter imports without Torch or model downloads. Its hosted
+# Nemotron mode loads nvidia-riva-client only when the first inference runs.
 try:
     from .nemotron_speech_impl import NemotronSpeechASR
     __all__.append('NemotronSpeechASR')
 except ImportError:
     pass
-
