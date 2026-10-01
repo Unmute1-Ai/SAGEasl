@@ -20,27 +20,40 @@ Unmute1AI-specific changes should preserve upstream attribution and be isolated/
 
 ## NVIDIA Nemotron Speech ASR
 
-`sage.irp.plugins.NemotronSpeechASR` is an optional one-shot SAGE IRP plugin for
-an already deployed NVIDIA Nemotron Speech ASR NIM. It uses the documented
-offline `POST /v1/audio/transcriptions` multipart endpoint (default HTTP port
-9000). Configure `base_url` explicitly or set `NEMOTRON_SPEECH_URL`; remote
-endpoints must use HTTPS. Plain HTTP is accepted only for loopback development.
-For an authorized NVIDIA-hosted endpoint, provide `NVIDIA_API_KEY` through the
-process environment or a secret manager; never store it in source control.
+`sage.irp.plugins.NemotronSpeechASR` is an optional one-shot SAGE IRP plugin.
+Its default path streams a local PCM WAV file to NVIDIA's hosted Nemotron ASR
+Streaming function through the documented Riva/NVCF gRPC API. Install the
+optional client dependency with `python -m pip install -r
+nvidia-speech-requirements.txt`. Provide `NVIDIA_API_KEY` through a process
+environment or secret manager, and set
+`NVIDIA_NEMOTRON_ASR_FUNCTION_ID` to the active function ID from NVIDIA's
+Nemotron ASR catalog. Function IDs are deployment-specific and are not
+hardcoded. The client uses TLS, the Riva `function-id` and bearer metadata,
+and a bounded gRPC deadline.
 
 ```python
 from sage.irp.plugins import NemotronSpeechASR
 
-asr = NemotronSpeechASR({"base_url": "https://speech.example.internal:9000"})
+asr = NemotronSpeechASR({"language": "en-US", "timeout_seconds": 60})
 final_state, history = asr.refine("recording.wav", {})
 transcript_candidate = asr.extract(final_state)
 ```
 
-Accepted inputs are local WAV, OPUS, and FLAC files up to 25 MiB. The plugin
-does not start a microphone, deploy a model, infer confidence, or fall back to
-another recognizer. Its output is explicitly marked `trusted=False` and
-`authority=none`; it is an observation for downstream SAGE reasoning, and any
-proposed action still passes the external U1 Sentinel gate. HTTP failures,
-redirects, malformed responses, and unavailable endpoints raise
-`NemotronSpeechError` and produce no transcript candidate.
+The hosted Nemotron streaming path accepts local mono, 16-bit PCM WAV files up
+to 25 MiB. It does not start a microphone, deploy a model, infer confidence, or
+fall back to another recognizer. Its output is explicitly marked
+`trusted=False` and `authority=none`; it is an observation for downstream SAGE
+reasoning, and any proposed action still passes the external U1 Sentinel gate.
+Transport failures, timeouts, malformed responses, and unavailable endpoints
+raise `NemotronSpeechError` and produce no transcript candidate.
 
+For an already deployed, offline-capable Speech NIM, explicitly select
+`mode="nim_offline"` and provide `base_url` (or `NEMOTRON_SPEECH_URL`). This
+uses multipart `POST /v1/audio/transcriptions`; the deployed model profile must
+support offline inference. Nemotron ASR Streaming itself is streaming-only, so
+it must use the default Riva/NVCF path above, not the offline HTTP route. Remote
+HTTP endpoints require HTTPS; plain HTTP is accepted only for loopback
+development. If that private endpoint requires authentication, use its own
+`NEMOTRON_SPEECH_API_KEY` secret or pass `api_key` in the application's
+secret-backed config. The hosted `NVIDIA_API_KEY` is never forwarded to this
+separate HTTP endpoint. Keep all credentials out of source control.
