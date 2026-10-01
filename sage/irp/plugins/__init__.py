@@ -17,3 +17,12 @@ __all__ = []
 if _FULL:
     __all__ += ['VisionIRP', 'LanguageIRP', 'ControlIRP', 'MemoryIRP',
                 'TinyVAEIRP', 'create_tinyvae_irp']
+
+# Speech NIM adapter is lightweight and does not require torch, riva-client,
+# or model downloads. Keep it independently importable in minimal deployments.
+try:
+    from .nemotron_speech_impl import NemotronSpeechASR
+    __all__.append('NemotronSpeechASR')
+except ImportError:
+    pass
+
